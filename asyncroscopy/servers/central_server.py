@@ -9,7 +9,7 @@ import struct
 # Define backend server addresses
 AS_SERVER = ("localhost", 9001)
 GATAN_SERVER = ("localhost", 9002)
-
+CEOS_Server = ("localhost", 9003)
 
 class BackendClient(Int32StringReceiver):
     """Handles communication with a backend server (AS, Gatan, CEOS, etc)."""
@@ -52,6 +52,9 @@ class CentralProtocol(Protocol):
         elif msg.startswith("Gatan"):
             target_host, target_port = GATAN_SERVER
             backend_cmd = msg[len("Gatan_"):]
+        elif msg.startswith("CEOS"):
+            target_host, target_port = CEOS_Server
+            backend_cmd = msg[len("CEOS_"):]
         else:
             self.transport.write(b"error unknown command")
             self.transport.loseConnection()
