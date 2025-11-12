@@ -67,7 +67,7 @@ class ASProtocol(ExecutionProtocol):
             self.factory.status = "Busy"
             image = self.microscope.acquisition.acquire_stem_image(
                 scanning_detector = 'HAADF', 
-                size = args[0], 
+                size = size, 
                 dwell_time = dwell_time)
             self.factory.status = "Ready"
             return image.tobytes()
