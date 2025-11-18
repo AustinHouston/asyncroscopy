@@ -56,12 +56,16 @@ def unpackage_message(packet: bytes):
     Inverse of package_message. Returns (dtype: str, shape: tuple[int,...], payload_data)
     payload_data is bytes for binary dtypes, or decoded string for 'str', or numpy array for numeric types.
     """
-    end_idx = packet.index(b']') + 1
-    header = packet[:end_idx].decode("ascii")
-    payload = packet[end_idx:]
-    parts = header[1:-1].split(",")
-    dtype, *shape_parts = parts
-    shape = tuple(int(x) for x in shape_parts) if shape_parts else ()
+    try:
+        end_idx = packet.index(b']') + 1
+        header = packet[:end_idx].decode("ascii")
+        payload = packet[end_idx:]
+        parts = header[1:-1].split(",")
+        dtype, *shape_parts = parts
+        shape = tuple(int(x) for x in shape_parts) if shape_parts else ()
+    except Exception:
+        # malformed header -> return raw bytes
+        return "bytes", (), packet
     if dtype == "str":
         return dtype, shape, payload.decode("utf-8")
     if dtype == "uint8":

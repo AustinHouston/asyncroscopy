@@ -1,13 +1,15 @@
 # central_server.py
 import json
+import inspect
 import logging
 import socket
 import struct
 from typing import Dict, Tuple, Optional
+from datetime import datetime
 
 import numpy as np
 from twisted.internet import reactor
-from twisted.internet.defer import Deferred, inlineCallbacks, returnValue
+from twisted.internet.defer import Deferred, inlineCallbacks, returnValue, gatherResults
 from twisted.internet.endpoints import TCP4ClientEndpoint, connectProtocol
 from twisted.protocols.basic import Int32StringReceiver
 from twisted.internet.protocol import Factory
@@ -80,7 +82,6 @@ class CentralProtocol(Int32StringReceiver):
     def stringReceived(self, data: bytes):
         """Main entry point for incoming client/backend messages."""
         try:
-            print(data)
             msg = data.decode("utf-8").strip()
         except Exception:
             # If decode fails, send standardized error
@@ -118,32 +119,34 @@ class CentralProtocol(Int32StringReceiver):
         return False
 
     def _handle_central_command(self, msg: str) -> bool:
-        """
-        Handle Central_* commands. Returns True if handled.
-        Supports:
-        - Central_set_routing_table routing_table=<json string>
-        """
-        log.info("[Central] this here: %s", msg)
         parts = msg.split()
-        cmd = parts[0][8:]  # remove "Central_"
-        if cmd == "set_routing_table":
+        if not parts:
+            return False
+        cmd_name = parts[0]
+        if cmd_name == "Central_set_routing_table":
             try:
-                if len(parts) == 2 and parts[1].startswith("routing_table="):
-                    import json
-                    json_arg = parts[1].split("=", 1)[1]
-                    rt = json.loads(json_arg)
-                    routing = {k: tuple(v) for k, v in rt.items()}  # list → tuple
-                else:
-                    # fallback to old multi-token parser
-                    routing = self._parse_routing_table(parts[1:])
+                # Re-assemble split tokens like  AS=('127.0.0.1', 9001)
+                cleaned, buf = [], []
+                for tok in parts[1:]:
+                    buf.append(tok)
+                    if tok.endswith(")"):
+                        cleaned.append(" ".join(buf))
+                        buf = []
 
-                self.set_routing_table(routing)
-                self.sendString(package_message("[Central] Updated routing table"))
+                routing_table = {}
+                for item in cleaned:
+                    k, v = item.split("=", 1)
+                    inner = v.strip()[1:-1]                     # remove ( )
+                    host_part, port_part = inner.split(",", 1)
+                    host = host_part.strip().strip("'\"")
+                    port = int(port_part.strip())
+                    routing_table[k.strip()] = (host, port)
 
+                self.set_routing_table(routing_table)
+                self.sendString(package_message("[Central] Routing table updated"))
             except Exception as e:
                 log.exception("Failed to set routing table")
                 self.sendString(package_message(f"[Central ERROR] {e}"))
-
             return True
 
         return False
@@ -255,94 +258,19 @@ class CentralProtocol(Int32StringReceiver):
         host, port = self.routing_table[prefix]
         return self._connect_and_send(host, port, command)
 
-# ---------- SmartProxy (orchestration) ----------
-class SmartProxy(CentralProtocol):
-    """
-    Extend CentralProtocol to add programmable orchestration methods named Central_*.
-    If an incoming message starts with 'Central_<name>' and a corresponding method exists,
-    the method is invoked. Methods may return bytes, strings, or Deferreds (or use inlineCallbacks).
-    """
-
-    def stringReceived(self, data: bytes):
-        """
-        If message starts with Central_, dispatch to method, otherwise fallback to base.
-        """
-        try:
-            msg = data.decode("utf-8").strip()
-        except Exception:
-            self.sendString(package_message("[Central] Invalid UTF-8 in request"))
-            return
-
-        if msg.startswith("Central_"):
-            parts = msg.split()
-            method_name = parts[0]            # e.g. "Central_get_image"
-            args = parts[1:]
-
-            if hasattr(self, method_name):
-                method = getattr(self, method_name)
-                try:
-                    result = method(*args)
-                except Exception as e:
-                    log.exception("Central method raised synchronously")
-                    self.sendString(package_message(f"[Central ERROR] {e}"))
-                    return
-
-                # If method returned a Deferred-like (twisted Deferred), attach callbacks
-                if isinstance(result, Deferred):
-                    result.addCallback(self._send_result_payload)
-                    result.addErrback(lambda f: self.sendString(package_message(f"[Central ERROR] {f}")))
-                else:
-                    # Immediate result: normalize and send
-                    try:
-                        # If bytes, send directly; else package
-                        if isinstance(result, (bytes, bytearray)):
-                            self.sendString(result)
-                        else:
-                            self.sendString(package_message(result))
-                    except Exception:
-                        log.exception("Failed to send Central method result")
-                return
-
-            else:
-                self.sendString(package_message(f"[Central] Unknown central method {method_name}"))
-                return
-
-        # fallback to normal central behavior
-        super().stringReceived(data)
-
-    # Example orchestrator; users can add methods named Central_*
-    @inlineCallbacks
-    def Central_get_image(self, *args):
-        """
-        Example orchestration:
-         - ask AS for an image
-         - ask Gatan to analyze it
-         - return the Gatan result
-        """
-        log.info("SmartProxy: Central_get_image called with args=%s", args)
-        raw = yield self._ask_backend("AS", "get_scanned_image")
-        # raw is raw framed bytes; unpackage to get numeric array
-        _, _, arr = unpackage_message(raw)
-        # do some trivial processing here (e.g., average)
-        # but for demo, forward arr size to Gatan
-        rows, cols = arr.shape
-        gatan_resp = yield self._ask_backend("Gatan", f"analyze_image rows={rows} cols={cols}")
-        # forward Gatan reply directly to client
-        returnValue(gatan_resp)
-
 # ---------- Factory ----------
 class CentralFactory(Factory):
-    def __init__(self, routing_table: Optional[Dict[str, Tuple[str,int]]] = None, proxy_class=CentralProtocol):
+    def __init__(self, routing_table= DEFAULT_ROUTING_TABLE):
         super().__init__()
-        self.routing_table = routing_table or dict(DEFAULT_ROUTING_TABLE)
-        self.proxy_class = proxy_class
+        self.routing_table = routing_table
+        self.protocol = CentralProtocol
 
     def buildProtocol(self, addr):
-        return self.proxy_class(routing_table=self.routing_table)
+        return self.protocol(routing_table=self.routing_table)
 
 # ---------- Run server ----------
 if __name__ == "__main__":
     log.info("Central server running on port 9000...")
-    factory = CentralFactory(routing_table=DEFAULT_ROUTING_TABLE, proxy_class=SmartProxy)
+    factory = CentralFactory(routing_table=DEFAULT_ROUTING_TABLE)
     reactor.listenTCP(9000, factory)
     reactor.run()
