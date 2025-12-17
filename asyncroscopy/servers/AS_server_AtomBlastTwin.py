@@ -19,6 +19,7 @@ from asyncroscopy.servers.protocols.utils import package_message, unpackage_mess
 from pathlib import Path
 from ase.io import read
 from ase import Atoms
+from ase.neighborlist import NeighborList
 
 HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parent
@@ -208,53 +209,6 @@ class ASProtocol(ExecutionProtocol):
         self.log.info(f"[AS] {msg}")
         self.sendString(package_message(msg))
 
-#     def _apply_beam_dose(self, duration):
-#         """Apply electron dose to the dose map and calculate damage"""
-#         if self.factory.atoms is None:
-#             self.log.warning("[AS] No sample loaded. Cannot apply dose.")
-#             return
-#         
-#         if self.factory.beam_blanked:
-#             return
-#         
-#         # Calculate total electrons delivered
-#         # current (pA) * duration (s) / electron charge (C)
-#         e_charge = 1.602e-19  # Coulombs
-#         total_electrons = (self.factory.beam_current * 1e-12 * duration) / e_charge
-#         
-#         # get current probe:
-#         tem = NotebookClient.connect(host='localhost', port=9000)
-#         ab = tem.send_command(destination='Ceos', command='getAberrations', args={})
-#         ab = ast.literal_eval(ab)
-#         ab['acceleration_voltage'] = self.factory.acceleration_voltage
-#         ab['FOV'] = self.factory.fov / 12
-#         ab['convergence_angle'] = 30  # mrad
-#         ab['wavelength'] = it.get_wavelength(ab['acceleration_voltage'])
-#         probe = dg.get_probe(ab, np.zeros(self.factory.grid_shape))
-#         # now, probe is a np array
-#         # use it instead of this gaussian:
-# 
-#         # Create Gaussian beam profile
-#         # Convert normalized coordinates to angstroms
-#         x_norm, y_norm = self.factory.beam_position
-#         x_beam = x_norm * self.factory.fov
-#         y_beam = y_norm * self.factory.fov
-#         probe_size = 0.5  # angstroms (FWHM)
-#         sigma = probe_size / 2.355  # Convert FWHM to sigma
-#         y_coords = np.linspace(0, self.factory.fov, self.factory.grid_shape[0])
-#         x_coords = np.linspace(0, self.factory.fov, self.factory.grid_shape[1])
-#         X, Y = np.meshgrid(x_coords, y_coords)
-#         beam_profile = np.exp(-((X - x_beam)**2 + (Y - y_beam)**2) / (2 * sigma**2))
-#         beam_profile /= beam_profile.sum()  # Normalize
-#         
-#         # Add dose to dose map (electrons per Ų)
-#         pixel_area = self.factory.pixel_size ** 2
-#         dose_increment = beam_profile * total_electrons / pixel_area
-#         self.factory.dose_map += dose_increment
-#         
-#         # Apply damage based on accumulated dose
-#         self._apply_damage_model()
-        
     def _apply_beam_dose(self, duration):
         """Apply electron dose to the dose map using the real probe"""
         if self.factory.atoms is None:
@@ -303,51 +257,186 @@ class ASProtocol(ExecutionProtocol):
 
     def _apply_damage_model(self):
         """
-        Apply probabilistic damage to atoms based on dose map.
-        Damage mechanisms:
-        1. Knock-on damage (elastic scattering)
-        2. Ionization damage (inelastic scattering)
-        3. Healing (random atom recovery - simplified)
+        Knock-on damage with coordination instability and vacancy clustering.
         """
+
         if self.factory.atoms is None:
             return
-        
-        positions = self.factory.atoms.get_positions()[:, :2]  # x, y only
+
+        atoms = self.factory.atoms
+        positions = atoms.get_positions()
+        symbols = atoms.get_chemical_symbols()
+
         pixel_size = self.factory.pixel_size
-        
-        # For each atom, calculate local dose and damage probability
+        dose_map = self.factory.dose_map
+        ny, nx = self.factory.grid_shape
+
+        # --------------------------------------------------
+        # Knock-on cross sections at 200 kV (Å²)
+        # --------------------------------------------------
+        sigma_knockon = {
+            "S": 3e-7,
+            "Se": 1e-7,
+            "Mo": 1e-9,
+            "W": 5e-10,
+        }
+
+        # --------------------------------------------------
+        # Ideal coordination numbers
+        # --------------------------------------------------
+        ideal_coordination = {
+            "S": 3,
+            "Se": 3,
+            "Mo": 6,
+            "W": 6,
+        }
+
+        # --------------------------------------------------
+        # Neighbor list (first shell only)
+        # --------------------------------------------------
+        cutoffs = []
+        for sym in symbols:
+            if sym in ("S", "Se"):
+                cutoffs.append(2.8)
+            else:
+                cutoffs.append(3.2)
+
+        nl = NeighborList(cutoffs, self_interaction=False, bothways=True)
+        nl.update(atoms)
+
         atoms_to_remove = []
-        
-        for i, (x, y) in enumerate(positions):
-            # Find pixel indices
+
+        # --------------------------------------------------
+        # Vacancy clustering parameters
+        # --------------------------------------------------
+        alpha = 4.0  # coordination instability
+        beta = 4.0   # vacancy-edge enhancement
+
+        for i, (pos, sym) in enumerate(zip(positions, symbols)):
+            # -------------------------
+            # Dose lookup
+            # -------------------------
+            x, y = pos[:2]
             ix = int(x / pixel_size)
             iy = int(y / pixel_size)
-            
-            # Check bounds
-            if 0 <= ix < self.factory.grid_shape[1] and 0 <= iy < self.factory.grid_shape[0]:
-                local_dose = self.factory.dose_map[iy, ix]
-                
-                # Calculate damage probability
-                # P_knockout = 1 - exp(-sigma * dose)
-                # Combine knock-on and ionization
-                
-                # Convert cross sections from cm² to Ų (1 cm² = 1e16 Ų)
-                sigma_ko = self.factory.knockout_cross_section * 1e16
-                sigma_ion = self.factory.ionization_cross_section * 1e16
-                
-                # Total damage probability
-                p_damage = 1 - np.exp(-(sigma_ko + sigma_ion) * local_dose)
-                
-                # Add randomness
-                if np.random.rand() < p_damage:
-                    atoms_to_remove.append(i)
-        
-        # Remove damaged atoms
+
+            if not (0 <= ix < nx and 0 <= iy < ny):
+                continue
+
+            local_dose = dose_map[iy, ix]
+
+            sigma = sigma_knockon.get(sym, 0.0)
+            if sigma <= 0.0:
+                continue
+
+            # -------------------------
+            # Neighbor analysis
+            # -------------------------
+            neighbors, offsets = nl.get_neighbors(i)
+            N = len(neighbors)
+            N0 = ideal_coordination.get(sym, N)
+
+            # Missing neighbors = adjacent vacancies
+            missing = max(N0 - N, 0)
+
+            # -------------------------
+            # Base knock-on probability
+            # -------------------------
+            p_base = 1.0 - np.exp(-sigma * local_dose)
+
+            # Convert to rate-like form
+            lambda_base = -np.log(1.0 - p_base)
+
+            # -------------------------
+            # Coordination instability
+            # -------------------------
+            if N < N0:
+                frac_lost = missing / N0
+                coord_factor = np.exp(alpha * frac_lost)
+            else:
+                coord_factor = 1.0
+
+            # -------------------------
+            # Vacancy clustering enhancement
+            # -------------------------
+            # Each missing neighbor boosts damage strongly
+            vacancy_factor = np.exp(beta * missing / N0)
+
+            # -------------------------
+            # Final probability
+            # -------------------------
+            lambda_eff = lambda_base * coord_factor * vacancy_factor
+            p_remove = 1.0 - np.exp(-lambda_eff)
+
+            if np.random.rand() < p_remove:
+                atoms_to_remove.append(i)
+
         if atoms_to_remove:
-            mask = np.ones(len(self.factory.atoms), dtype=bool)
+            mask = np.ones(len(atoms), dtype=bool)
             mask[atoms_to_remove] = False
-            self.factory.atoms = self.factory.atoms[mask]
-            self.log.info(f"[AS] Removed {len(atoms_to_remove)} atoms due to beam damage")
+            self.factory.atoms = atoms[mask]
+
+            self.log.info(f"[AS] Vacancy clustering removed {len(atoms_to_remove)} atoms")
+
+#     def _apply_damage_model(self):
+#         """
+#         Knock-on beam damage model for 200 kV STEM.
+#         
+#         P_remove = 1 - exp(-sigma(E) * local_dose)
+# 
+#         Dose units: e / Å²
+#         Cross sections: Å²
+#         """
+# 
+#         if self.factory.atoms is None:
+#             return
+# 
+#         atoms = self.factory.atoms
+#         positions = atoms.get_positions()[:, :2]
+#         symbols = atoms.get_chemical_symbols()
+# 
+#         pixel_size = self.factory.pixel_size
+#         dose_map = self.factory.dose_map
+#         ny, nx = self.factory.grid_shape
+# 
+#         # --------------------------------------------------
+#         # Knock-on cross sections at 200 kV (Å²)
+#         # Order-of-magnitude correct
+#         # --------------------------------------------------
+#         sigma_knockon_200kV = {
+#             "C": 1e-7,
+#             "S": 3e-7,
+#             "Se": 1e-7,
+#             "Mo": 1e-9,
+#             "W": 5e-10,
+#         }
+# 
+#         atoms_to_remove = []
+# 
+#         for i, ((x, y), sym) in enumerate(zip(positions, symbols)):
+#             ix = int(x / pixel_size)
+#             iy = int(y / pixel_size)
+# 
+#             if not (0 <= ix < nx and 0 <= iy < ny):
+#                 continue
+# 
+#             local_dose = dose_map[iy, ix]
+# 
+#             sigma = sigma_knockon_200kV.get(sym, 0.0)
+#             if sigma <= 0.0:
+#                 continue
+# 
+#             p_remove = 1.0 - np.exp(-sigma * local_dose)
+# 
+#             if np.random.rand() < p_remove:
+#                 atoms_to_remove.append(i)
+# 
+#         if atoms_to_remove:
+#             mask = np.ones(len(atoms), dtype=bool)
+#             mask[atoms_to_remove] = False
+#             self.factory.atoms = atoms[mask]
+# 
+#             self.log.info(f"[AS] 200 kV knock-on damage removed {len(atoms_to_remove)} atoms")
 
     def get_dose_map(self, args=None):
         """Return the current accumulated dose map"""
