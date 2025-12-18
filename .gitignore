@@ -223,3 +223,4 @@ AS_1.14_wheels/
 *.pyc
 
 *.png
+*.npz
