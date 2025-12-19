@@ -38,7 +38,7 @@ class CeosProtocol(ExecutionProtocol):
     def __init__(self):
         super().__init__()
         self.host = "10.46.217.241"
-        self.port = 7072
+        self.port = 9092 #7072
         self._nextMessageID = 1
         self._pendingCommands = {}
 

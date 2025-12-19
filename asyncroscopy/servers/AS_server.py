@@ -151,9 +151,10 @@ class ASProtocol(ExecutionProtocol):
         sets resting beam position, [0:1]
         """
         mic = self.factory.microscope
-        beam_pos = args.get('beam_pos')
-        x = beam_pos[0]
-        y = beam_pos[1]
+        x = args.get('x')
+        y = args.get('y')
+        x = float(x)
+        y = float(y)
         mic.optics.paused_scan_beam_position = (x, y)
 
         msg = f"Beam moved to {x}, {y}"
@@ -164,7 +165,7 @@ class ASProtocol(ExecutionProtocol):
         """blank beam"""
         self.factory.microscope.optics.blanker.blank()
 
-        msg = f"Beam unblanked for {dwell_time}s"
+        msg = f"Beam blanked"
         self.log.info(f"[AS] {msg}")
         self.sendString(package_message(msg))
 
@@ -173,7 +174,7 @@ class ASProtocol(ExecutionProtocol):
         unblank beam
         optional dwell time, then auto-blank
         """
-        dwell_time = args.get('dwell_time')
+        dwell_time = args.get('duration')
         
         # unblank here
         msg = "Beam unblanked"
