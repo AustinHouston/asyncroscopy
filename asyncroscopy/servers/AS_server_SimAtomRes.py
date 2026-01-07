@@ -114,9 +114,7 @@ class ASProtocol(ExecutionProtocol):
             ab['convergence_angle'] = 30 # mrad
             ab['wavelength'] = it.get_wavelength(ab['acceleration_voltage'])
 
-            # make image
-            # with pystemsim data generator
-            # print("check the cif path ")
+            # create sample
             cif_path = (
                 PROJECT_ROOT
                 / "cloned_repos"
@@ -125,26 +123,27 @@ class ASProtocol(ExecutionProtocol):
             )
             print("Reading CIF from:", cif_path)
             xtal = read(cif_path)
-            # xtal = read('asyncroscopy/cloned_repos/pystemsim/WS2_ortho.cif')
             xtal = xtal * (30, 20, 1)
-            positions = xtal.get_positions()[:, :2]
             pixel_size = 0.106 # angstrom/pixel
             frame = (0,fov,0,fov) # limits of the image in angstroms
+
+            # create image
             potential = dg.create_pseudo_potential(xtal, pixel_size, sigma=1, bounds=frame, atom_frame=11)
             probe = dg.get_probe(ab, potential)
             image = dg.convolve_kernel(potential, probe)
-            noisy_image = dg.lowfreq_noise(image, noise_level=0.5, freq_scale=.04)
 
+            # add shot noise
             scan_time = dwell_time * size * size
             counts = scan_time * (self.factory.beam_current * 1e-12) / (1.602e-19)
-            sim_im = dg.poisson_noise(noisy_image, counts=counts)
-            # convert args dict
+            noisy_image = dg.poisson_noise(image, counts=counts)
+
+            # add gaussian blob-like noise
+            noisy_image = dg.lowfreq_noise(noisy_image, noise_level=0.5, freq_scale=.1)
 
             # time.sleep(1)
-            image = np.array(image, dtype=np.float32)
-            # image = (np.random.rand(size, size) * 255).astype(np.uint8)
+            sim_im = np.array(noisy_image, dtype=np.float32)
             self.factory.status = "Ready"
-            self.sendString(package_message(image))
+            self.sendString(package_message(sim_im))
 
 
     def get_stage(self, args=None):
