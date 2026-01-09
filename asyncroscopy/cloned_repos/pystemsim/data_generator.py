@@ -276,10 +276,11 @@ def lowfreq_noise(image, noise_level=0.1, freq_scale=0.1):
     # Apply the frequency filter to the noise in the frequency domain
     filtered_noise_fft = noise_fft * freq_filter
     low_freq_noise = np.fft.ifft2(filtered_noise_fft).real
-    noisy_image = image + low_freq_noise
-    noisy_image = image.like_data(noisy_image)
+    noise = image.like_data(low_freq_noise)
+    noise = noise - noise.min()
+    noise = noise / noise.max()
 
-    return noisy_image
+    return noise
 
 
 def grid_crop(image_master, crop_size=512, crop_glide=128):

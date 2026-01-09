@@ -91,10 +91,20 @@ class ASProtocol(ExecutionProtocol):
     def get_scanned_image(self, args: dict):
         """Return a scanned image using the indicated detector"""
         scanning_detector = args.get('scanning_detector')
+
         size = args.get('size')
-        dwell_time = args.get('dwell_time')
         size = int(size)
+
+        dwell_time = args.get('dwell_time')
         dwell_time = float(dwell_time)
+
+        fov = args.get('fov') # Angstrom
+        fov = float(fov) # Angstrom
+        pixel_size = fov / size
+        edge_crop = 20
+
+        blur_noise_level = args.get('blur_noise', 0.5)
+        blur_noise_level = float(blur_noise_level)
 
         if dwell_time * size * size > 600: # frame time > 10 minutes
             self.log.info(f"[AS] Error: Acquisition too long: {dwell_time*size*size} seconds")
@@ -109,14 +119,11 @@ class ASProtocol(ExecutionProtocol):
             ab = tem.send_command(destination = 'Ceos', command = 'getAberrations', args = {})
             ab = ast.literal_eval(ab)
             ab['acceleration_voltage'] = 60e3 # eV
-            fov = 96 # angstroms
-            ab['FOV'] = fov /12 # Angstroms
+            ab['FOV'] = fov /10 # nm
             ab['convergence_angle'] = 30 # mrad
             ab['wavelength'] = it.get_wavelength(ab['acceleration_voltage'])
 
-            # make image
-            # with pystemsim data generator
-            # print("check the cif path ")
+            # create sample
             cif_path = (
                 PROJECT_ROOT
                 / "cloned_repos"
@@ -125,26 +132,33 @@ class ASProtocol(ExecutionProtocol):
             )
             print("Reading CIF from:", cif_path)
             xtal = read(cif_path)
-            # xtal = read('asyncroscopy/cloned_repos/pystemsim/WS2_ortho.cif')
-            xtal = xtal * (30, 20, 1)
-            positions = xtal.get_positions()[:, :2]
-            pixel_size = 0.106 # angstrom/pixel
-            frame = (0,fov,0,fov) # limits of the image in angstroms
+            a = xtal.cell[0][0]
+            b = xtal.cell[1][1]
+            xtal_multiplier = (int(1.4*fov/a), int(1.4*fov/b), 1)
+            xtal = xtal * xtal_multiplier
+
+            edge = 2 * edge_crop * pixel_size
+            frame = (0,fov+edge,0,fov+edge) # limits of the image in angstroms
+            
+            # create image
             potential = dg.create_pseudo_potential(xtal, pixel_size, sigma=1, bounds=frame, atom_frame=11)
             probe = dg.get_probe(ab, potential)
             image = dg.convolve_kernel(potential, probe)
-            noisy_image = dg.lowfreq_noise(image, noise_level=0.5, freq_scale=.04)
+            image = image[edge_crop:-edge_crop, edge_crop:-edge_crop]
 
+            # add shot noise
             scan_time = dwell_time * size * size
-            counts = scan_time * (self.factory.beam_current * 1e-12) / (1.602e-19)
-            sim_im = dg.poisson_noise(noisy_image, counts=counts)
-            # convert args dict
+            counts = scan_time * (self.factory.beam_current * 1e-12) / (1.602e-19) / 100
+            noisy_image = dg.poisson_noise(image, counts=counts)
+
+            # add gaussian blob-like noise
+            blur_noise = dg.lowfreq_noise(noisy_image, noise_level=0.1, freq_scale=.5)
+            noisy_image += blur_noise * blur_noise_level
 
             # time.sleep(1)
-            image = np.array(image, dtype=np.float32)
-            # image = (np.random.rand(size, size) * 255).astype(np.uint8)
+            sim_im = np.array(noisy_image, dtype=np.float32)
             self.factory.status = "Ready"
-            self.sendString(package_message(image))
+            self.sendString(package_message(sim_im))
 
 
     def get_stage(self, args=None):
