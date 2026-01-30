@@ -70,14 +70,14 @@ class CentralProtocol(Int32StringReceiver):
 
     def __init__(self, routing_table: Optional[Dict[str, Tuple[str,int]]] = None):
         super().__init__()
-        self.routing_table = routing_table or dict(DEFAULT_ROUTING_TABLE)
+        self.routing_table = factory.routing_table
 
     def connectionMade(self):
         peer = self.transport.getPeer()
         log.info("[Central] Connection made from %s", peer)
 
     def connectionLost(self, reason):
-        log.info("[Central] Connection lost: %s", reason)
+        log.info("[Central] Connection ended") # : %s", reason
 
     def stringReceived(self, data: bytes):
         """Main entry point for incoming client/backend messages."""
@@ -136,12 +136,12 @@ class CentralProtocol(Int32StringReceiver):
                 routing_table = {}
                 for item in cleaned:
                     k, v = item.split("=", 1)
-                    inner = v.strip()[1:-1]                     # remove ( )
+                    inner = v.strip()[1:-1] # remove ( )
                     host_part, port_part = inner.split(",", 1)
                     host = host_part.strip().strip("'\"")
                     port = int(port_part.strip())
                     routing_table[k.strip()] = (host, port)
-
+                    print(routing_table)
                 self.set_routing_table(routing_table)
                 self.sendString(package_message("[Central] Routing table updated"))
             except Exception as e:
@@ -198,6 +198,7 @@ class CentralProtocol(Int32StringReceiver):
 
     def set_routing_table(self, routing_table: Dict[str, Tuple[str,int]]):
         self.routing_table = routing_table
+        factory.routing_table = routing_table
         log.info("Routing table updated: %s", self.routing_table)
 
     # ----- connection/send helpers -----
